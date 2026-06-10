@@ -101,32 +101,140 @@ async def classify_description(
             )
 
     # ── 2. Full classification pipeline ──────────────────────
-    # The real LLM ensemble + RAG pipeline will be injected here.
-    # For now we create a pending transaction state so the API contract
-    # is fully exercised end-to-end.
+    from app.core.llm import get_llm_provider
+    from app.rag.retriever import MultiPathRetriever
+    from app.rules.engine import TariffRuleEngine
+    from app.prompts.templates import COMPARATIVE_CLASSIFICATION_PROMPT
+    import json as _json
+
+    llm = get_llm_provider()
+    retriever = MultiPathRetriever(session, llm)
+    rule_engine = TariffRuleEngine(session)
+
+    # Step 1: Multi-Path RAG retrieval
+    from datetime import date
+    candidates_raw = await retriever.retrieve(
+        description=body.description,
+        invoice_date=date.today(),
+        jurisdiction=body.country_of_origin or "IN",
+    )
+
+    response_candidates: list[CandidatePath] = []
+    excluded_list: list[ExcludedCandidate] = []
+    final_code = "0000.00.0000"
+    final_confidence = 0.0
+    final_reasoning = "No candidates found"
+    needs_review = True
+    review_reason = "No classification candidates found in tariff database"
+
+    if candidates_raw:
+        # Step 2: Rule Engine filter
+        filtered = await rule_engine.filter_candidates(candidates_raw, body.description)
+
+        # Build excluded list
+        for exc in filtered.excluded_candidates:
+            excluded_list.append(ExcludedCandidate(
+                hs_code=exc.code,
+                description=exc.description,
+                exclusion_reason=exc.exclusion_reason,
+                confidence=0.0,
+            ))
+
+        if filtered.valid_candidates:
+            # Step 3: LLM Comparative Reasoning
+            candidates_context = "\n\n".join(
+                f"--- Option {i+1} ---\n"
+                f"Code: {c.code}\n"
+                f"Description: {c.description}\n"
+                f"Section Notes: {c.section_notes or 'N/A'}\n"
+                f"Chapter Notes: {c.chapter_notes or 'N/A'}\n"
+                f"Similarity Score: {c.similarity_score:.3f}"
+                for i, c in enumerate(filtered.valid_candidates)
+            )
+
+            try:
+                llm_response = await llm.complete(
+                    messages=[
+                        {"role": "system", "content": COMPARATIVE_CLASSIFICATION_PROMPT},
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Classify this commodity:\n\n"
+                                f"DESCRIPTION: {body.description}\n"
+                                f"COUNTRY OF ORIGIN: {body.country_of_origin or 'Not specified'}\n\n"
+                                f"CANDIDATE CLASSIFICATIONS:\n{candidates_context}\n\n"
+                                f"Return JSON: {{\"code\": \"XXXX.XX.XX\", \"confidence\": 0.XX, \"reasoning\": \"...\"}}"
+                            ),
+                        },
+                    ],
+                    temperature=0.0,
+                )
+
+                # Parse LLM JSON response
+                raw_content = llm_response.content.strip()
+                # Strip markdown code fences if present
+                if raw_content.startswith("```"):
+                    raw_content = raw_content.split("\n", 1)[-1].rsplit("```", 1)[0]
+                parsed = _json.loads(raw_content)
+
+                final_code = parsed.get("code", "0000.00.0000")
+                final_confidence = float(parsed.get("confidence", 0.5))
+                final_reasoning = parsed.get("reasoning", raw_content)
+                needs_review = final_confidence < 0.85
+                review_reason = None if not needs_review else (
+                    f"Confidence {final_confidence:.0%} below auto-approve threshold (85%)"
+                )
+
+                # Build candidate list for response
+                response_candidates.append(CandidatePath(
+                    hs_code=final_code,
+                    description=final_reasoning[:200],
+                    confidence=final_confidence,
+                    strategy="ensemble_llm",
+                    reasoning=final_reasoning,
+                ))
+
+            except Exception as llm_err:
+                final_code = "REVIEW_REQUIRED"
+                final_confidence = 0.0
+                needs_review = True
+                review_reason = f"LLM classification error: {llm_err}"
+
+    # Persist the TransactionState
     txn = TransactionState(
-        status="pending",
-        current_node="classification_start",
-        needs_review=True,
-        review_reason="Pipeline not yet wired — manual review required",
+        status="completed" if not needs_review else "pending_review",
+        current_node="classification_complete",
+        final_hs_code=final_code,
+        final_confidence=final_confidence,
+        needs_review=needs_review,
+        review_reason=review_reason,
     )
     session.add(txn)
     await session.flush()
     await session.refresh(txn)
 
+    # Write back to cache for future lookups
+    if final_confidence >= 0.85:
+        new_cache = ClassificationCache(
+            description_hash=desc_hash,
+            description_text=body.description[:500],
+            hs_code=final_code,
+            confidence=final_confidence,
+            source_strategy="ensemble_llm",
+        )
+        session.add(new_cache)
+
     elapsed = (time.monotonic_ns() // 1_000_000) - start_ms
 
-    # Placeholder response — will be replaced once the LangGraph pipeline
-    # is integrated.
     return ClassifyResponse(
         transaction_id=txn.id,
         description=body.description,
-        recommended_hs_code="0000.00.0000",
-        confidence=0.0,
-        needs_review=True,
-        review_reason="Classification pipeline pending integration",
-        candidates=[],
-        excluded=[],
+        recommended_hs_code=final_code,
+        confidence=final_confidence,
+        needs_review=needs_review,
+        review_reason=review_reason,
+        candidates=response_candidates,
+        excluded=excluded_list,
         processing_time_ms=elapsed,
         cache_hit=cache_hit,
         created_at=datetime.now(timezone.utc),

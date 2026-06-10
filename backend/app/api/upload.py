@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_session
+from app.core.storage import get_storage_backend
 from app.models.invoice import Invoice
 from app.schemas.invoice import InvoiceResponse
 
@@ -62,8 +63,9 @@ async def upload_invoice(
     invoice_id = uuid.uuid4()
     storage_key = f"invoices/{invoice_id}/{file.filename}"
 
-    # TODO: Wire real storage backend — for now we just record the key.
-    # await storage.upload(storage_key, contents, content_type=file.content_type)
+    # ── Store file in configured backend (local / S3) ────────
+    storage = get_storage_backend()
+    await storage.upload(storage_key, contents, content_type=file.content_type or "application/octet-stream")
 
     # ── Parse optional client_id ──────────────────────────────
     parsed_client_id: uuid.UUID | None = None
