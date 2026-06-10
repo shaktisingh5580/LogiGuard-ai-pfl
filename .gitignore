@@ -1,0 +1,51 @@
+# ──────────────────────────────────────────────────────────────
+# LogiGuard AI — .gitignore
+# ──────────────────────────────────────────────────────────────
+
+# ── Environment & Secrets ─────────────────────────────────────
+.env
+*.env.local
+
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── Virtual Environment ──────────────────────────────────────
+venv/
+.venv/
+ENV/
+
+# ── IDE ───────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ── Docker Volumes (local) ───────────────────────────────────
+postgres_data/
+minio_data/
+
+# ── Storage (uploaded files) ─────────────────────────────────
+storage/
+
+# ── Testing ──────────────────────────────────────────────────
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# ── Type Checking ────────────────────────────────────────────
+.mypy_cache/
+.ruff_cache/
+
+# ── OS ───────────────────────────────────────────────────────
+Thumbs.db
+Desktop.ini
