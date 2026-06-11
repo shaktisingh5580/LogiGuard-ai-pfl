@@ -8,9 +8,8 @@ processing.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
-
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, Response
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_session
@@ -90,3 +89,35 @@ async def upload_invoice(
     await session.refresh(invoice)
 
     return InvoiceResponse.model_validate(invoice)
+
+@router.get("/invoices", response_model=list[InvoiceResponse])
+async def list_invoices(
+    limit: int = 50,
+    offset: int = 0,
+    session: AsyncSession = Depends(get_session),
+) -> list[InvoiceResponse]:
+    """List uploaded invoices, newest first."""
+    stmt = select(Invoice).order_by(Invoice.created_at.desc()).limit(limit).offset(offset)
+    result = await session.execute(stmt)
+    invoices = result.scalars().all()
+    return [InvoiceResponse.model_validate(inv) for inv in invoices]
+
+@router.get("/invoices/{invoice_id}/file")
+async def get_invoice_file(
+    invoice_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """Download or stream the invoice file."""
+    stmt = select(Invoice).where(Invoice.id == invoice_id)
+    invoice = (await session.execute(stmt)).scalar_one_or_none()
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+        
+    storage = get_storage_backend()
+    try:
+        content = await storage.download(invoice.storage_key)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="File not found in storage")
+        
+    return Response(content=content, media_type=invoice.content_type)
+

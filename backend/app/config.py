@@ -32,7 +32,7 @@ class Settings(BaseSettings):
 
     # ── Database ──────────────────────────────────────────────
     DATABASE_URL: str = (
-        "postgresql+asyncpg://logiguard:logiguard_dev@localhost:5432/logiguard"
+        "postgresql+asyncpg://logiguard:logiguard_dev@localhost:5435/logiguard"
     )
 
     # ── Redis ─────────────────────────────────────────────────
