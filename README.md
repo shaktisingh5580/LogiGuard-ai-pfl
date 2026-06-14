@@ -17,7 +17,11 @@
 *LogiGuard AI automates the classification of trade goods into Harmonized System (HS) tariff codes using a 6-layer AI pipeline. It combines OCR extraction, semantic RAG search, deterministic rule engines, LLM-based comparative reasoning, and a human-in-the-loop review queue — all producing an immutable audit trail suitable for customs compliance.*
 
 </div>
+---
 
+> 📘 **[Read the Full Technical Documentation (20+ Pages) →](https://github.com/shaktisingh5580/LogiGuard-ai-pfl/blob/main/backend/README.md)**
+>
+> Covers system architecture diagrams, 6-layer pipeline deep-dive, database ER diagrams, Multi-Path RAG design, SSE event system, data ingestion pipelines, and competitive analysis.
 ---
 
 ## Table of Contents
