@@ -98,8 +98,20 @@ class TariffRule(Base):
     explanatory_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     general_rules: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     keywords: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
-    embedding: Mapped[Optional[list]] = mapped_column(Vector(1536), nullable=True)
+    embedding: Mapped[Optional[list]] = mapped_column(Vector(768), nullable=True)
     chunk_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    
+    # Rule engine specific fields
+    rule_type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    applies_to_section: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    applies_to_chapter: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+    applies_to_heading: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+    condition_type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    condition_parameters: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    statutory_reference: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    jurisdiction: Mapped[Optional[str]] = mapped_column(String(3), nullable=True, default="IN")
+    effective_until: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+
     metadata_: Mapped[Optional[dict]] = mapped_column("metadata", JSONB, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(

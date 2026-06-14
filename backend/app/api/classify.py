@@ -134,9 +134,9 @@ async def classify_description(
         # Build excluded list
         for exc in filtered.excluded_candidates:
             excluded_list.append(ExcludedCandidate(
-                hs_code=exc.code,
-                description=exc.description,
-                exclusion_reason=exc.exclusion_reason,
+                hs_code=exc.candidate.code,
+                description=exc.candidate.description,
+                exclusion_reason=f"{exc.reason} [{exc.statutory_reference}]",
                 confidence=0.0,
             ))
 

@@ -45,10 +45,10 @@ class TransactionState(Base):
         primary_key=True,
         server_default=text("gen_random_uuid()"),
     )
-    invoice_id: Mapped[uuid.UUID] = mapped_column(
+    invoice_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("invoices.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
         index=True,
     )
     line_item_id: Mapped[Optional[uuid.UUID]] = mapped_column(

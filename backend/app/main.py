@@ -28,7 +28,8 @@ async def lifespan(app: FastAPI):
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     logger.info("🚀 LogiGuard AI starting up (env=%s)", settings.APP_ENV)
-    logger.info("   LLM Provider: %s (%s)", settings.LLM_PROVIDER, settings.LLM_MODEL)
+    model_name = settings.GEMINI_MODEL if settings.LLM_PROVIDER == "gemini" else settings.LLM_MODEL
+    logger.info("   LLM Provider: %s (%s)", settings.LLM_PROVIDER, model_name)
     logger.info("   Storage: %s", settings.STORAGE_BACKEND)
     logger.info("   Database: %s", settings.DATABASE_URL.split("@")[-1])
 

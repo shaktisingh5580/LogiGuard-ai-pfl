@@ -71,6 +71,10 @@ class MultiPathRetriever:
     def __init__(self, db: AsyncSession, llm: LLMProvider | None = None):
         self._db = db
         self._llm = llm or get_llm_provider()
+        # Per-run caches — avoid re-querying the same chapter notes / lineage
+        # across multiple line items on the same invoice.
+        self._lineage_cache: dict[str, TariffLineage | None] = {}
+        self._notes_cache: dict[str, list[str]] = {}
 
     async def retrieve(
         self,
@@ -154,25 +158,26 @@ class MultiPathRetriever:
         # For the demo, we'll do a text-based fuzzy search if embeddings
         # aren't set up yet. In production, this uses pgvector.
         try:
-            result = await self._db.execute(
-                text("""
-                    SELECT code, description,
-                           1.0 - (embedding <=> :query_embedding::vector) as similarity
-                    FROM hs_tariff_tree
-                    WHERE jurisdiction = :jurisdiction
-                      AND level IN ('HEADING', 'SUBHEADING')
-                      AND embedding IS NOT NULL
-                    ORDER BY embedding <=> :query_embedding::vector
-                    LIMIT :top_k
-                """),
-                {
-                    "query_embedding": str(query_embedding),
-                    "jurisdiction": jurisdiction,
-                    "top_k": top_k,
-                },
-            )
-            rows = result.fetchall()
-            return [(r[0], r[1], float(r[2])) for r in rows]
+            # Use a savepoint so that if the vector column doesn't exist or dimensions mismatch,
+            # the transaction is safely rolled back to this point and the fallback query can run.
+            async with self._db.begin_nested():
+                result = await self._db.execute(
+                    text("""
+                        SELECT code, description,
+                               1.0 - (embedding <=> :query_embedding::vector) as similarity
+                        FROM hs_tariff_tree
+                        WHERE level IN (3, 4)
+                          AND embedding IS NOT NULL
+                        ORDER BY embedding <=> :query_embedding::vector
+                        LIMIT :top_k
+                    """),
+                    {
+                        "query_embedding": str(query_embedding),
+                        "top_k": top_k,
+                    },
+                )
+                rows = result.fetchall()
+                return [(r[0], r[1], float(r[2])) for r in rows]
         except Exception as e:
             logger.warning("Vector search failed (falling back to text): %s", e)
             return await self._text_fallback_search(jurisdiction, top_k)
@@ -181,19 +186,20 @@ class MultiPathRetriever:
         self, jurisdiction: str, top_k: int
     ) -> list[tuple[str, str, float]]:
         """Fallback: simple text search when embeddings aren't available."""
-        result = await self._db.execute(
-            text("""
-                SELECT code, description, 0.5 as similarity
-                FROM hs_tariff_tree
-                WHERE jurisdiction = :jurisdiction
-                  AND level IN ('HEADING', 'SUBHEADING')
-                ORDER BY RANDOM()
-                LIMIT :top_k
-            """),
-            {"jurisdiction": jurisdiction, "top_k": top_k},
-        )
-        rows = result.fetchall()
-        return [(r[0], r[1], float(r[2])) for r in rows]
+        # Create a savepoint for the fallback too, just in case there are any other schema issues
+        async with self._db.begin_nested():
+            result = await self._db.execute(
+                text("""
+                    SELECT code, description, 0.5 as similarity
+                    FROM hs_tariff_tree
+                    WHERE level IN (3, 4)
+                    ORDER BY RANDOM()
+                    LIMIT :top_k
+                """),
+                {"top_k": top_k},
+            )
+            rows = result.fetchall()
+            return [(r[0], r[1], float(r[2])) for r in rows]
 
     def _enforce_chapter_diversity(
         self,
@@ -222,33 +228,47 @@ class MultiPathRetriever:
             diverse.extend(candidates)
         return diverse
 
+    # Integer level values used in hs_tariff_tree
+    _LEVEL_NAMES = {1: "SECTION", 2: "CHAPTER", 3: "HEADING", 4: "SUBHEADING", 5: "TARIFF_LINE"}
+
     async def _build_lineage(
         self, code: str, jurisdiction: str
     ) -> TariffLineage | None:
         """Walk up the tariff tree to build full Section→Chapter→Heading→Sub path."""
+        cache_key = f"{code}:{jurisdiction}"
+        if cache_key in self._lineage_cache:
+            return self._lineage_cache[cache_key]
+
         try:
-            result = await self._db.execute(
-                text("""
-                    WITH RECURSIVE lineage AS (
-                        SELECT code, description, level, parent_code, 0 as depth
-                        FROM hs_tariff_tree
-                        WHERE code = :code AND jurisdiction = :jurisdiction
-                        UNION ALL
-                        SELECT t.code, t.description, t.level, t.parent_code, l.depth + 1
-                        FROM hs_tariff_tree t
-                        JOIN lineage l ON t.code = l.parent_code
-                        WHERE t.jurisdiction = :jurisdiction
-                    )
-                    SELECT code, description, level FROM lineage ORDER BY depth DESC
-                """),
-                {"code": code, "jurisdiction": jurisdiction},
-            )
+            async with self._db.begin_nested():
+                result = await self._db.execute(
+                    text("""
+                        WITH RECURSIVE lineage AS (
+                            SELECT id, code, description, level, parent_id, 0 as depth
+                            FROM hs_tariff_tree
+                            WHERE code = :code
+                            UNION ALL
+                            SELECT t.id, t.code, t.description, t.level, t.parent_id, l.depth + 1
+                            FROM hs_tariff_tree t
+                            JOIN lineage l ON t.id = l.parent_id
+                        )
+                        SELECT code, description, level FROM lineage ORDER BY depth DESC
+                    """),
+                    {"code": code},
+                )
             rows = result.fetchall()
             if not rows:
+                self._lineage_cache[cache_key] = None
                 return None
 
-            levels = {r[2]: (r[0], r[1]) for r in rows}
-            return TariffLineage(
+            # Map integer level numbers to named slots
+            # Level: 1=SECTION, 2=CHAPTER, 3=HEADING, 4=SUBHEADING
+            levels: dict[str, tuple[str, str]] = {}
+            for r in rows:
+                level_name = self._LEVEL_NAMES.get(r[2], f"LEVEL_{r[2]}")
+                levels[level_name] = (r[0], r[1])
+
+            lineage = TariffLineage(
                 section=levels.get("SECTION", ("", ""))[0],
                 section_description=levels.get("SECTION", ("", ""))[1],
                 chapter=levels.get("CHAPTER", ("", ""))[0],
@@ -259,6 +279,8 @@ class MultiPathRetriever:
                 subheading_description=levels.get("SUBHEADING", (code, ""))[1],
                 code=code,
             )
+            self._lineage_cache[cache_key] = lineage
+            return lineage
         except Exception as e:
             logger.warning("Lineage lookup failed for %s: %s", code, e)
             return None
@@ -267,19 +289,25 @@ class MultiPathRetriever:
         self, rule_type: str, code: str, jurisdiction: str
     ) -> list[str]:
         """Fetch section/chapter notes from tariff_rules table."""
+        cache_key = f"{rule_type}:{code}:{jurisdiction}"
+        if cache_key in self._notes_cache:
+            return self._notes_cache[cache_key]
+
         try:
-            col = "applies_to_section" if rule_type == "SECTION_NOTE" else "applies_to_chapter"
-            result = await self._db.execute(
-                text(f"""
-                    SELECT description FROM tariff_rules
-                    WHERE rule_type = :rule_type
-                      AND {col} = :code
-                      AND jurisdiction = :jurisdiction
-                    LIMIT 10
-                """),
-                {"rule_type": rule_type, "code": code, "jurisdiction": jurisdiction},
-            )
-            return [r[0] for r in result.fetchall()]
+            async with self._db.begin_nested():
+                col = "section" if rule_type == "SECTION_NOTE" else "chapter"
+                result = await self._db.execute(
+                    text(f"""
+                        SELECT description FROM tariff_rules
+                        WHERE {col} = :code
+                          AND (jurisdiction = :jurisdiction OR jurisdiction IS NULL)
+                        LIMIT 10
+                    """),
+                    {"code": code, "jurisdiction": jurisdiction},
+                )
+            notes = [r[0] for r in result.fetchall()]
+            self._notes_cache[cache_key] = notes
+            return notes
         except Exception as e:
             logger.warning("Notes lookup failed: %s", e)
             return []

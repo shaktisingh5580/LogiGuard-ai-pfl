@@ -66,13 +66,13 @@ class Invoice(Base):
         back_populates="invoice", cascade="all, delete-orphan", lazy="selectin",
     )
     extraction_results: Mapped[List["ExtractionResult"]] = relationship(
-        back_populates="invoice", cascade="all, delete-orphan", lazy="selectin",
+        back_populates="invoice", cascade="all, delete-orphan", lazy="select",
     )
     transaction_states: Mapped[List["TransactionState"]] = relationship(
-        back_populates="invoice", cascade="all, delete-orphan", lazy="selectin",
+        back_populates="invoice", cascade="all, delete-orphan", lazy="select",
     )
     audit_logs: Mapped[List["AuditLog"]] = relationship(
-        back_populates="invoice", cascade="all, delete-orphan", lazy="selectin",
+        back_populates="invoice", cascade="all, delete-orphan", lazy="select",
     )
 
     __table_args__ = (

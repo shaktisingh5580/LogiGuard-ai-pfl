@@ -1,6 +1,7 @@
 """SSE event publisher using Redis pub/sub for real-time pipeline updates."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -57,7 +58,7 @@ class PipelineEvent:
 
 
 class EventPublisher:
-    """Publishes pipeline events via Redis pub/sub.
+    """Publishes pipeline events via Redis pub/sub or in-memory fallback.
 
     Any frontend (React, mobile, CLI) can subscribe to the SSE endpoint
     to receive real-time pipeline updates.
@@ -67,6 +68,7 @@ class EventPublisher:
 
     def __init__(self, redis_client: Any = None):
         self._redis = redis_client
+        self._subscribers: list[asyncio.Queue[PipelineEvent]] = []
 
     async def publish(self, event: PipelineEvent) -> None:
         """Publish an event to all subscribers."""
@@ -75,6 +77,11 @@ class EventPublisher:
                 await self._redis.publish(self.CHANNEL, json.dumps(event.to_dict()))
             except Exception as e:
                 logger.warning("Failed to publish event to Redis: %s", e)
+        else:
+            # In-memory fallback
+            for queue in self._subscribers:
+                queue.put_nowait(event)
+
         logger.info(
             "Event: %s | invoice=%s | data=%s",
             event.event_type.value,
@@ -84,25 +91,31 @@ class EventPublisher:
 
     async def subscribe(self) -> AsyncGenerator[PipelineEvent, None]:
         """Subscribe to pipeline events (for SSE endpoint)."""
-        if not self._redis:
-            logger.warning("No Redis client — SSE subscription not available")
-            return
-
-        pubsub = self._redis.pubsub()
-        await pubsub.subscribe(self.CHANNEL)
-
-        try:
-            async for message in pubsub.listen():
-                if message["type"] == "message":
-                    data = json.loads(message["data"])
-                    yield PipelineEvent(
-                        event_type=EventType(data["event"]),
-                        invoice_id=data["invoice_id"],
-                        data=data.get("data"),
-                        line_item_id=data.get("line_item_id"),
-                    )
-        finally:
-            await pubsub.unsubscribe(self.CHANNEL)
+        if self._redis:
+            pubsub = self._redis.pubsub()
+            await pubsub.subscribe(self.CHANNEL)
+            try:
+                async for message in pubsub.listen():
+                    if message["type"] == "message":
+                        data = json.loads(message["data"])
+                        yield PipelineEvent(
+                            event_type=EventType(data["event"]),
+                            invoice_id=data["invoice_id"],
+                            data=data.get("data"),
+                            line_item_id=data.get("line_item_id"),
+                        )
+            finally:
+                await pubsub.unsubscribe(self.CHANNEL)
+        else:
+            # In-memory fallback
+            queue: asyncio.Queue[PipelineEvent] = asyncio.Queue()
+            self._subscribers.append(queue)
+            try:
+                while True:
+                    event = await queue.get()
+                    yield event
+            finally:
+                self._subscribers.remove(queue)
 
 
 # Singleton for the app lifetime

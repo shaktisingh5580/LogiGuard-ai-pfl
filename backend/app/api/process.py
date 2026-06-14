@@ -12,11 +12,10 @@ This is the endpoint the frontend calls after uploading a PDF.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import uuid
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -29,37 +28,16 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-@router.post("/invoices/{invoice_id}/process")
+@router.post("/invoices/{invoice_id}/process", status_code=202)
 async def process_invoice(
     invoice_id: uuid.UUID,
-    background: bool = Query(
-        False,
-        description="If true, run processing in the background and return immediately",
-    ),
-    background_tasks: BackgroundTasks = BackgroundTasks(),
+    background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
 ):
     """Trigger the full AI classification pipeline for an uploaded invoice.
 
-    This endpoint:
-    1. Downloads the PDF from storage
-    2. Extracts text using PyMuPDF (OCR not needed for clean PDFs)
-    3. Sends the text to your LLM for structured line-item extraction
-    4. Classifies each line item through RAG + Rules + LLM
-    5. Saves everything to the database
-    6. Broadcasts progress via SSE events
-
-    The frontend should:
-    - Call this after uploading a PDF via POST /api/invoices
-    - Connect to GET /api/events?invoice_id=xxx for real-time progress
-    - Poll GET /api/invoices/{id} to see the final results
-
-    Args:
-        invoice_id: UUID of the previously uploaded invoice.
-        background: If true, returns immediately and processes in background.
-
-    Returns:
-        Processing result with classified line items and statistics.
+    Returns 202 immediately and processes in background so the frontend
+    doesn't time out on large invoices. Use SSE events for real-time progress.
     """
     # Validate the invoice exists
     stmt = select(Invoice).where(Invoice.id == invoice_id)
@@ -68,35 +46,40 @@ async def process_invoice(
     if not invoice:
         raise HTTPException(status_code=404, detail=f"Invoice not found: {invoice_id}")
 
-    if invoice.status not in ("uploaded", "error", "extraction_failed"):
+    if invoice.status in ("processing", "completed", "classified"):
+        return {
+            "invoice_id": str(invoice_id),
+            "status": invoice.status,
+            "message": f"Invoice is already in '{invoice.status}' state",
+        }
+
+    if invoice.status not in ("uploaded", "error", "extraction_failed", "pending_review"):
         raise HTTPException(
             status_code=409,
-            detail=f"Invoice is already in '{invoice.status}' state. "
-            f"Only 'uploaded', 'error', or 'extraction_failed' invoices can be processed.",
+            detail=f"Invoice is in '{invoice.status}' state. Only uploaded/error/extraction_failed invoices can be processed.",
         )
 
-    # Run the pipeline
-    processor = InvoiceProcessor(session)
+    # Mark as processing immediately so the UI updates right away
+    invoice.status = "processing"
+    await session.flush()  # Write to DB within current transaction
+    # The get_session dependency commits on exit — we need the status committed now
+    # so the background task can see it; commit explicitly here.
+    await session.commit()
 
-    if background:
-        # Run in background — return immediately
-        # Note: For background processing, we'd need a separate session.
-        # For now, we run synchronously to keep it simple and reliable.
-        pass
+    # Run the full pipeline in the background
+    async def _run_pipeline():
+        from app.database import async_session_factory
+        async with async_session_factory() as bg_session:
+            processor = InvoiceProcessor(bg_session)
+            await processor.process(invoice_id)
 
-    result = await processor.process(invoice_id)
+    background_tasks.add_task(_run_pipeline)
 
-    if result.get("status") == "error":
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "message": "Pipeline processing failed",
-                "error": result.get("error"),
-                "invoice_id": str(invoice_id),
-            },
-        )
-
-    return result
+    return {
+        "invoice_id": str(invoice_id),
+        "status": "processing",
+        "message": "Pipeline started in background. Listen to SSE events for progress.",
+    }
 
 
 @router.get("/invoices/{invoice_id}/status")
@@ -109,7 +92,15 @@ async def get_processing_status(
     Returns the invoice status and its line items with classification results.
     Useful for polling after triggering /process.
     """
-    stmt = select(Invoice).where(Invoice.id == invoice_id)
+    from sqlalchemy.orm import selectinload
+    stmt = (
+        select(Invoice)
+        .where(Invoice.id == invoice_id)
+        .options(
+            selectinload(Invoice.line_items),
+            selectinload(Invoice.transaction_states)
+        )
+    )
     invoice = (await session.execute(stmt)).scalar_one_or_none()
 
     if not invoice:

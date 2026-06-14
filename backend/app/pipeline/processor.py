@@ -24,12 +24,12 @@ import uuid
 from datetime import date, datetime, timezone
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import select, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.core.events import EventType, PipelineEvent, get_event_publisher
-from app.core.llm import get_llm_provider
+from app.core.llm import LLMProvider, get_llm_provider
 from app.core.storage import get_storage_backend
 from app.models.classification import ExtractionResult, TransactionState
 from app.models.invoice import Invoice, LineItem
@@ -43,10 +43,40 @@ logger = logging.getLogger(__name__)
 # ── PDF Text Extraction ─────────────────────────────────────────────────────
 
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
-    """Extract text from PDF bytes using PyMuPDF (fast, no external deps).
+    """Extract text from PDF bytes as structured Markdown.
 
-    Falls back to a simple bytes-decode if PyMuPDF is not installed.
+    Uses pymupdf4llm to convert the PDF into Markdown with preserved table
+    structure (| Column | Table | syntax).  Falls back to raw PyMuPDF text
+    extraction if pymupdf4llm is not available, and finally to a plain bytes
+    decode as a last resort.
     """
+    # ── Best path: pymupdf4llm → structured Markdown with tables ──
+    try:
+        import pymupdf4llm
+        import tempfile
+        import os
+
+        # pymupdf4llm operates on file paths, so write bytes to a temp file
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp.write(pdf_bytes)
+            tmp_path = tmp.name
+        try:
+            md_text = pymupdf4llm.to_markdown(tmp_path)
+        finally:
+            os.unlink(tmp_path)
+
+        logger.info(
+            "pymupdf4llm extracted %d characters of structured Markdown",
+            len(md_text),
+        )
+        return md_text
+
+    except ImportError:
+        logger.warning("pymupdf4llm not installed — falling back to raw PyMuPDF")
+    except Exception as e:
+        logger.warning("pymupdf4llm extraction failed (%s) — falling back to raw PyMuPDF", e)
+
+    # ── Fallback: raw PyMuPDF text (tables may lose structure) ──
     try:
         import fitz  # PyMuPDF
 
@@ -110,9 +140,10 @@ OUTPUT FORMAT (strict JSON, no markdown fences):
 RULES:
 - Extract EVERY line item, even if partially visible
 - Preserve exact commodity descriptions — do NOT paraphrase or summarize
-- If a field is missing or unreadable, use null
-- Quantities must be numeric (not text like "five hundred")
-- Return ONLY valid JSON — no commentary, no markdown code fences"""
+- If a field is missing or unreadable, use null (or 0.0 for numbers)
+- Quantities must be numeric. If missing or unreadable, default to 1.0
+- Return ONLY valid JSON — no commentary, no markdown code fences
+- CRITICAL: Scan the text carefully for ANY shipped goods or products. DO NOT return an empty line_items array unless absolutely no products exist in the text."""
 
 
 async def structure_invoice_text(raw_text: str) -> dict[str, Any]:
@@ -135,17 +166,51 @@ async def structure_invoice_text(raw_text: str) -> dict[str, Any]:
         ],
         temperature=0.0,
         max_tokens=4096,
+        response_format={"type": "json_object"}
     )
 
     raw_content = response.content.strip()
-    # Strip markdown code fences if the LLM wraps its output
-    if raw_content.startswith("```"):
-        raw_content = raw_content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
 
     try:
         return json.loads(raw_content)
     except json.JSONDecodeError as e:
         logger.error("LLM structuring returned invalid JSON: %s", e)
+        logger.debug("Raw LLM response: %s", raw_content[:500])
+        return {"line_items": [], "parse_error": str(e), "raw_response": raw_content[:1000]}
+
+
+async def structure_invoice_with_vision(pdf_bytes: bytes) -> dict[str, Any]:
+    """Send raw PDF bytes to LLM for structured extraction using multimodal vision."""
+    llm = get_llm_provider()
+    import base64
+
+    pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+    
+    response = await llm.complete_with_vision(
+        messages=[
+            {"role": "system", "content": STRUCTURING_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Extract all line items from this invoice PDF document. Return ONLY valid JSON, do NOT use markdown code blocks."},
+                    {"type": "image_url", "image_url": {"url": f"data:application/pdf;base64,{pdf_b64}"}}
+                ],
+            },
+        ],
+        temperature=0.0,
+        max_tokens=4096,
+    )
+    
+    raw_content = response.content.strip()
+    if raw_content.startswith("```"):
+        raw_content = raw_content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    if raw_content.startswith("json"):
+        raw_content = raw_content[4:].strip()
+        
+    try:
+        return json.loads(raw_content)
+    except json.JSONDecodeError as e:
+        logger.error("LLM vision structuring returned invalid JSON: %s", e)
         logger.debug("Raw LLM response: %s", raw_content[:500])
         return {"line_items": [], "parse_error": str(e), "raw_response": raw_content[:1000]}
 
@@ -156,56 +221,68 @@ async def classify_single_item(
     session: AsyncSession,
     description: str,
     country_of_origin: str | None = None,
+    *,
+    llm: LLMProvider | None = None,
+    retriever: MultiPathRetriever | None = None,
+    rule_engine: TariffRuleEngine | None = None,
 ) -> dict[str, Any]:
     """Run the full RAG + Rules + LLM classification for a single description.
 
+    Args:
+        session: Database session.
+        description: Commodity description to classify.
+        country_of_origin: ISO 2-letter country code.
+        llm: Pre-built LLM provider (avoids re-creation per item).
+        retriever: Pre-built RAG retriever (caches notes/lineage across items).
+        rule_engine: Pre-built rule engine (caches rules after first load).
+
     Returns a dict with: code, confidence, reasoning, needs_review, review_reason
     """
-    llm = get_llm_provider()
-    retriever = MultiPathRetriever(session, llm)
-    rule_engine = TariffRuleEngine(session)
-
-    # Step 1: RAG retrieval
-    candidates_raw = await retriever.retrieve(
-        description=description,
-        invoice_date=date.today(),
-        jurisdiction=country_of_origin or "IN",
-    )
-
-    if not candidates_raw:
-        return {
-            "code": "REVIEW_REQUIRED",
-            "confidence": 0.0,
-            "reasoning": "No matching tariff headings found in database",
-            "needs_review": True,
-            "review_reason": "No classification candidates found in tariff database",
-        }
-
-    # Step 2: Rule Engine filter
-    filtered = await rule_engine.filter_candidates(candidates_raw, description)
-
-    if not filtered.valid_candidates:
-        return {
-            "code": "REVIEW_REQUIRED",
-            "confidence": 0.0,
-            "reasoning": "All candidates excluded by rule engine",
-            "needs_review": True,
-            "review_reason": "All classification candidates were excluded by tariff rules",
-        }
-
-    # Step 3: LLM Comparative Reasoning
-    candidates_context = "\n\n".join(
-        f"--- Option {i + 1} ---\n"
-        f"Code: {c.code}\n"
-        f"Description: {c.description}\n"
-        f"Section Notes: {c.section_notes or 'N/A'}\n"
-        f"Chapter Notes: {c.chapter_notes or 'N/A'}\n"
-        f"Similarity Score: {c.similarity_score:.3f}"
-        for i, c in enumerate(filtered.valid_candidates)
-    )
-
     try:
-        llm_response = await llm.complete(
+        _llm = llm or get_llm_provider()
+        _retriever = retriever or MultiPathRetriever(session, _llm)
+        _rule_engine = rule_engine or TariffRuleEngine(session)
+
+        # Step 1: RAG retrieval
+        candidates_raw = await _retriever.retrieve(
+            description=description,
+            invoice_date=date.today(),
+            jurisdiction=country_of_origin or "IN",
+        )
+
+        if not candidates_raw:
+            return {
+                "code": "REVIEW_REQUIRED",
+                "confidence": 0.0,
+                "reasoning": "No matching tariff headings found in database",
+                "needs_review": True,
+                "review_reason": "No classification candidates found in tariff database",
+            }
+
+        # Step 2: Rule Engine filter
+        filtered = await _rule_engine.filter_candidates(candidates_raw, description)
+
+        if not filtered.valid_candidates:
+            return {
+                "code": "REVIEW_REQUIRED",
+                "confidence": 0.0,
+                "reasoning": "All candidates excluded by rule engine",
+                "needs_review": True,
+                "review_reason": "All classification candidates were excluded by tariff rules",
+            }
+
+        # Step 3: LLM Comparative Reasoning
+        candidates_context = "\n\n".join(
+            f"--- Option {i + 1} ---\n"
+            f"Code: {c.code}\n"
+            f"Description: {c.description}\n"
+            f"Section Notes: {c.section_notes or 'N/A'}\n"
+            f"Chapter Notes: {c.chapter_notes or 'N/A'}\n"
+            f"Similarity Score: {c.similarity_score:.3f}"
+            for i, c in enumerate(filtered.valid_candidates)
+        )
+
+        llm_response = await _llm.complete(
             messages=[
                 {"role": "system", "content": COMPARATIVE_CLASSIFICATION_PROMPT},
                 {
@@ -220,11 +297,13 @@ async def classify_single_item(
                 },
             ],
             temperature=0.0,
+            response_format={"type": "json_object"}
         )
 
         raw = llm_response.content.strip()
+        # Strip markdown code fences if present
         if raw.startswith("```"):
-            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
         parsed = json.loads(raw)
 
         code = parsed.get("code", "0000.00.0000")
@@ -249,9 +328,9 @@ async def classify_single_item(
         return {
             "code": "REVIEW_REQUIRED",
             "confidence": 0.0,
-            "reasoning": f"LLM classification error: {e}",
+            "reasoning": f"Classification error: {e}",
             "needs_review": True,
-            "review_reason": f"LLM classification error: {e}",
+            "review_reason": f"Classification error: {e}",
         }
 
 
@@ -270,6 +349,13 @@ class InvoiceProcessor:
     def __init__(self, session: AsyncSession):
         self._session = session
         self._publisher = get_event_publisher()
+
+        # ── Shared instances — created once, reused across all line items ──
+        # This avoids re-creating the LLM client, retriever, and rule engine
+        # for every single line item on an invoice.
+        self._llm = get_llm_provider()
+        self._retriever = MultiPathRetriever(session, self._llm)
+        self._rule_engine = TariffRuleEngine(session)
 
     async def _emit(self, event_type: EventType, invoice_id: uuid.UUID, data: dict | None = None):
         """Publish an SSE event."""
@@ -293,6 +379,11 @@ class InvoiceProcessor:
         if not invoice:
             raise ValueError(f"Invoice not found: {invoice_id}")
 
+        # Prevent concurrent processing (React strict-mode double firing)
+        if invoice.status in ("processing", "completed", "classified"):
+            logger.warning("Invoice %s is already in state: %s. Skipping duplicate processing.", invoice_id, invoice.status)
+            return {"invoice_id": str(invoice_id), "status": invoice.status, "message": "Already processing"}
+
         # Update status to processing
         invoice.status = "processing"
         await self._session.flush()
@@ -310,8 +401,6 @@ class InvoiceProcessor:
 
             # ── 3. Extract raw text ──────────────────────────────
             raw_text = extract_text_from_pdf_bytes(pdf_bytes)
-            if not raw_text.strip():
-                raise ValueError("PDF text extraction returned empty result — the PDF may be image-only")
 
             # Save the raw text to the invoice record
             invoice.raw_text = raw_text
@@ -324,11 +413,15 @@ class InvoiceProcessor:
 
             # ── 4. LLM Structuring (extract line items) ──────────
             await self._emit(EventType.CLASSIFICATION_STARTED, invoice_id, {
-                "message": "Sending extracted text to AI for structuring...",
+                "message": "Sending extracted data to AI for structuring...",
                 "step": "structuring",
             })
 
-            structured = await structure_invoice_text(raw_text)
+            if len(raw_text.strip()) < 50:
+                logger.info("PDF has very little text (%d chars), using vision-based extraction...", len(raw_text.strip()))
+                structured = await structure_invoice_with_vision(pdf_bytes)
+            else:
+                structured = await structure_invoice_text(raw_text)
 
             if structured.get("parse_error"):
                 logger.error("Structuring failed: %s", structured["parse_error"])
@@ -373,6 +466,10 @@ class InvoiceProcessor:
             # Determine the country_of_origin (invoice-level or per-item)
             invoice_origin = structured.get("country_of_origin")
 
+            # Clear any existing line items for this invoice to prevent UniqueViolationError on retry
+            await self._session.execute(delete(LineItem).where(LineItem.invoice_id == invoice_id))
+            await self._session.flush()
+
             db_line_items: list[LineItem] = []
             for idx, item in enumerate(line_items_data):
                 li = LineItem(
@@ -411,19 +508,23 @@ class InvoiceProcessor:
             results: list[dict[str, Any]] = []
 
             for idx, li in enumerate(db_line_items):
-                await self._emit(EventType.CLASSIFICATION_STARTED, invoice_id, {
-                    "message": f"Classifying item {idx + 1}/{total_items}: {li.description[:60]}...",
-                    "current_item": idx + 1,
-                    "total_items": total_items,
-                    "description": li.description[:100],
-                    "line_item_id": str(li.id),
-                })
+                # Throttle SSE events: send on 1st item, every 5th item, and last item
+                if idx == 0 or (idx + 1) % 5 == 0 or (idx + 1) == total_items:
+                    await self._emit(EventType.CLASSIFICATION_STARTED, invoice_id, {
+                        "message": f"Classifying item {idx + 1}/{total_items}: {li.description[:60]}...",
+                        "current_item": idx + 1,
+                        "total_items": total_items,
+                        "description": li.description[:60],
+                    })
 
                 # Run the classification
                 result = await classify_single_item(
                     session=self._session,
                     description=li.description,
                     country_of_origin=li.country_of_origin,
+                    llm=self._llm,
+                    retriever=self._retriever,
+                    rule_engine=self._rule_engine,
                 )
 
                 # Update line item with classification result
@@ -460,18 +561,20 @@ class InvoiceProcessor:
                     "needs_review": result["needs_review"],
                 })
 
-                await self._emit(EventType.CLASSIFICATION_COMPLETED, invoice_id, {
-                    "message": f"Classified {idx + 1}/{total_items}",
-                    "current_item": idx + 1,
-                    "total_items": total_items,
-                    "hs_code": result["code"],
-                    "confidence": result["confidence"],
-                    "needs_review": result["needs_review"],
-                    "line_item_id": str(li.id),
-                })
+                if idx == 0 or (idx + 1) % 5 == 0 or (idx + 1) == total_items:
+                    await self._emit(EventType.CLASSIFICATION_COMPLETED, invoice_id, {
+                        "message": f"Classified {idx + 1}/{total_items} items",
+                        "current_item": idx + 1,
+                        "total_items": total_items,
+                        "last_hs_code": result["code"],
+                        "hs_code": result["code"],
+                        "confidence": result["confidence"],
+                        "needs_review": result["needs_review"],
+                    })
 
             # ── 7. Finalize ──────────────────────────────────────
-            invoice.status = "classified"
+            # Set invoice status reflecting whether any items need human review
+            invoice.status = "pending_review" if review_count > 0 else "classified"
             await self._session.flush()
 
             elapsed_ms = int((time.monotonic() - start_time) * 1000)
@@ -506,8 +609,14 @@ class InvoiceProcessor:
 
         except Exception as e:
             logger.exception("Pipeline failed for invoice %s", invoice_id)
-            invoice.status = "error"
-            await self._session.flush()
+            await self._session.rollback()  # Crucial: Rollback the failed transaction first!
+            
+            # Re-fetch invoice in new transaction to update status safely
+            stmt = select(Invoice).where(Invoice.id == invoice_id)
+            invoice = (await self._session.execute(stmt)).scalar_one_or_none()
+            if invoice:
+                invoice.status = "error"
+                await self._session.flush()
 
             await self._emit(EventType.PIPELINE_ERROR, invoice_id, {
                 "message": f"Pipeline error: {e}",

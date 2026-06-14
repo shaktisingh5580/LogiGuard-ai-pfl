@@ -75,33 +75,40 @@ class TariffRuleEngine:
         if self._rules is not None:
             return self._rules
 
-        result = await self._db.execute(
-            text("""
-                SELECT rule_type, applies_to_section, applies_to_chapter,
-                       applies_to_heading, condition_type, condition_parameters,
-                       description, statutory_reference
-                FROM tariff_rules
-                WHERE jurisdiction = :jurisdiction
-                  AND (effective_until IS NULL OR effective_until >= CURRENT_DATE)
-                ORDER BY rule_type, applies_to_section, applies_to_chapter
-            """),
-            {"jurisdiction": jurisdiction},
-        )
+        try:
+            async with self._db.begin_nested():
+                result = await self._db.execute(
+                    text("""
+                        SELECT rule_type, applies_to_section, applies_to_chapter,
+                               applies_to_heading, condition_type, condition_parameters,
+                               description, statutory_reference
+                        FROM tariff_rules
+                        WHERE (jurisdiction = :jurisdiction OR jurisdiction IS NULL)
+                          AND (effective_until IS NULL OR effective_until >= CURRENT_DATE)
+                          AND rule_type IS NOT NULL
+                        ORDER BY rule_type, applies_to_section, applies_to_chapter
+                    """),
+                    {"jurisdiction": jurisdiction},
+                )
 
-        self._rules = [
-            TariffRule(
-                rule_type=r[0],
-                applies_to_section=r[1],
-                applies_to_chapter=r[2],
-                applies_to_heading=r[3],
-                condition_type=r[4],
-                condition_parameters=r[5] or {},
-                description=r[6],
-                statutory_reference=r[7],
-            )
-            for r in result.fetchall()
-        ]
-        logger.info("Loaded %d statutory rules for %s", len(self._rules), jurisdiction)
+                self._rules = [
+                    TariffRule(
+                        rule_type=r[0],
+                        applies_to_section=r[1],
+                        applies_to_chapter=r[2],
+                        applies_to_heading=r[3],
+                        condition_type=r[4],
+                        condition_parameters=r[5] or {},
+                        description=r[6],
+                        statutory_reference=r[7],
+                    )
+                    for r in result.fetchall()
+                ]
+                logger.info("Loaded %d statutory rules for %s", len(self._rules), jurisdiction)
+        except Exception as e:
+            logger.warning("Failed to load statutory rules (schema mismatch?): %s", e)
+            self._rules = []
+            
         return self._rules
 
     async def filter_candidates(

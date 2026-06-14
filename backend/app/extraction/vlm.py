@@ -115,7 +115,7 @@ class VLMExtractor:
 
     def __init__(self, client: AsyncOpenAI, settings: Settings) -> None:
         self._client = client
-        self._model = settings.LLM_MODEL
+        self._model = settings.llm_model
         self._max_tokens = 4096
 
     async def extract_from_image(self, image_bytes: bytes) -> RawExtraction:

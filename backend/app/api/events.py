@@ -40,7 +40,7 @@ async def stream_events(
         try:
             async for event in publisher.subscribe():
                 # If filtering by invoice_id, skip non-matching events
-                if invoice_id and event.invoice_id != invoice_id:
+                if invoice_id and event.invoice_id.lower() != invoice_id.lower():
                     continue
                 yield event.to_sse()
         except asyncio.CancelledError:

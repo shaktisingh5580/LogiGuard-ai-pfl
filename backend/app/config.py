@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     EMBEDDING_DIMENSIONS: int = 1536
 
+    # ── Google Gemini (via google-genai SDK) ──────────────────
+    GEMINI_API_KEY: str = ""
+    GEMINI_MODEL: str = "gemini-2.5-flash"
+    GEMINI_EMBEDDING_MODEL: str = "embedding-001"
+
     # ── Application ───────────────────────────────────────────
     APP_ENV: str = "development"
     APP_DEBUG: bool = True
@@ -59,7 +64,7 @@ class Settings(BaseSettings):
     CORS_ORIGINS: List[str] = ["*"]
 
     # ── Pluggable Backends ────────────────────────────────────
-    LLM_PROVIDER: str = "openai"              # openai | gemini (future)
+    LLM_PROVIDER: str = "openai"              # openai | gemini
     STORAGE_BACKEND: str = "local"            # local | s3
     LOCAL_STORAGE_PATH: str = "./storage"     # For local storage backend
 
@@ -83,6 +88,18 @@ class Settings(BaseSettings):
     @property
     def embedding_model(self) -> str:
         return self.EMBEDDING_MODEL
+
+    @property
+    def gemini_api_key(self) -> str:
+        return self.GEMINI_API_KEY
+
+    @property
+    def gemini_model(self) -> str:
+        return self.GEMINI_MODEL
+
+    @property
+    def gemini_embedding_model(self) -> str:
+        return self.GEMINI_EMBEDDING_MODEL
 
     @property
     def s3_endpoint_url(self) -> str:
@@ -138,3 +155,4 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Return a cached singleton of the application settings."""
     return Settings()
+
